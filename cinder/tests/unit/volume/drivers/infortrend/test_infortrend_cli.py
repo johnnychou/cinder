@@ -123,7 +123,9 @@ class InfortrendCLITestData(object):
         'iqn.2002-10.com.infortrend:raid.uid%s.%s%s%s') % (
             int(fake_system_id[0], 16), 1, 0, 1), (
         'iqn.2002-10.com.infortrend:raid.uid%s.%s%s%s') % (
-            int(fake_system_id[0], 16), 1, 0, 1),
+            int(fake_system_id[0], 16), 1, 0, 1), (
+        'iqn.2002-10.com.infortrend:raid.uid%s.%s%s%s') % (
+            int(fake_system_id[0], 16), 2, 0, 1),
     ]
 
     test_iscsi_properties = {
@@ -141,9 +143,9 @@ class InfortrendCLITestData(object):
         'driver_volume_type': 'iscsi',
         'data': {
             'target_discovered': True,
-            'target_portal': '%s:3260' % fake_data_port_ip[0],
-            'target_iqn': test_iqn[1],
-            'target_lun': fake_lun_map[2],
+            'target_portal': '%s:3260' % fake_data_port_ip[4],
+            'target_iqn': test_iqn[2],
+            'target_lun': fake_lun_map[1],
             'volume_id': test_volume['id'],
         },
     }
@@ -1310,7 +1312,7 @@ Return: 0x0000
             'Width': 'iSCSI',
             'Ch': '1',
             'MCS': '1',
-            'curClock': '---',
+            'curClock': 'Negotiated to 1Gbps, Full Duplex',
         }, {
             'ID': '0',
             'defClock': 'Auto',
@@ -1319,7 +1321,7 @@ Return: 0x0000
             'Width': 'iSCSI',
             'Ch': '2',
             'MCS': '1',
-            'curClock': '---',
+            'curClock': 'Negotiated to 1Gbps, Full Duplex',
         }, {
             'ID': '---',
             'defClock': '6.0 Gbps',
@@ -1337,7 +1339,7 @@ Return: 0x0000
             'Width': 'iSCSI',
             'Ch': '4',
             'MCS': '2',
-            'curClock': '---',
+            'curClock': 'Negotiated to 1Gbps, Full Duplex',
         }, {
             'ID': '112',
             'defClock': 'Auto',

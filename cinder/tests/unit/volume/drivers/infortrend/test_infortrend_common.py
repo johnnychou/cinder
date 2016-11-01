@@ -682,19 +682,21 @@ class InfortrendiSCSICommonTestCase(InfortrendTestCass):
         }
 
         test_map_chl = {
-            'slot_a': ['1', '2'],
+            'slot_a': ['1', '4'],
+            'slot_b': [],
         }
         test_map_lun = ['2']
-        test_mcs_id = '0'
         self.driver = self._get_driver(configuration)
         self.driver.mcs_dict = fake_mcs_dict
         self.driver.map_dict = fake_map_dict
 
-        map_chl, map_lun, mcs_id = self.driver._get_mapping_info_with_mcs()
+        map_chl, map_lun = self.driver._get_mapping_info_with_mpio()
+
+        map_chl['slot_a'].sort()
+        map_chl['slot_b'].sort()
 
         self.assertDictMatch(test_map_chl, map_chl)
         self.assertEqual(test_map_lun, map_lun)
-        self.assertEqual(test_mcs_id, mcs_id)
 
     def test_mapping_info_with_mcs_multi_group(self):
 
@@ -703,34 +705,39 @@ class InfortrendiSCSICommonTestCase(InfortrendTestCass):
 
         fake_mcs_dict = {
             'slot_a': {'0': ['1', '2'], '1': ['3', '4'], '2': ['5']},
-            'slot_b': {},
+            'slot_b': {'0': ['1', '2']},
         }
         lun_list = list(range(0, 127))
         fake_map_dict = {
             'slot_a': {
                 '1': lun_list[2:],
-                '2': lun_list[:],
+                '2': lun_list[3:],
                 '3': lun_list[:],
                 '4': lun_list[1:],
                 '5': lun_list[:],
             },
-            'slot_b': {},
+            'slot_b': {
+                '1': lun_list[:],
+                '2': lun_list[:],
+            },
         }
 
         test_map_chl = {
-            'slot_a': ['3', '4'],
+            'slot_a': ['1', '3', '5'],
+            'slot_b': ['1'],
         }
-        test_map_lun = ['1']
-        test_mcs_id = '1'
+        test_map_lun = ['2']
         self.driver = self._get_driver(configuration)
         self.driver.mcs_dict = fake_mcs_dict
         self.driver.map_dict = fake_map_dict
 
-        map_chl, map_lun, mcs_id = self.driver._get_mapping_info_with_mcs()
+        map_chl, map_lun = self.driver._get_mapping_info_with_mpio()
+
+        map_chl['slot_a'].sort()
+        map_chl['slot_b'].sort()
 
         self.assertDictMatch(test_map_chl, map_chl)
         self.assertEqual(test_map_lun, map_lun)
-        self.assertEqual(test_mcs_id, mcs_id)
 
     def test_specific_channel_with_multipath(self):
 
@@ -1332,6 +1339,8 @@ class InfortrendiSCSICommonTestCase(InfortrendTestCass):
 
         expect_cli_cmd = [
             mock.call('CreateIQN', test_initiator, test_initiator[-16:]),
+            mock.call('ShowNet'),
+            mock.call('ShowMap', 'part=6A41315B0EDC8EB7'),
             mock.call('CreateMap', 'part', test_partition_id, '2', '0', '0',
                       'iqn=%s' % test_connector['initiator']),
         ]
@@ -1409,13 +1418,12 @@ class InfortrendiSCSICommonTestCase(InfortrendTestCass):
     def test_initialize_connection_with_mcs(self):
 
         configuration = copy.copy(self.configuration)
-        configuration.use_multipath_for_image_xfer = True
 
         test_volume = self.cli_data.test_volume
         test_partition_id = self.cli_data.fake_partition_id[0]
         test_connector = copy.deepcopy(self.cli_data.test_connector_iscsi)
         test_iscsi_properties = self.cli_data.test_iscsi_properties_with_mcs
-        test_target_protal = [test_iscsi_properties['data']['target_portal']]
+        test_target_portal = [test_iscsi_properties['data']['target_portal']]
         test_target_iqn = [test_iscsi_properties['data']['target_iqn']]
 
         test_connector['multipath'] = False
@@ -1427,7 +1435,7 @@ class InfortrendiSCSICommonTestCase(InfortrendTestCass):
             'CreateMap': SUCCEED,
             'ShowNet': self.cli_data.get_test_show_net(),
             'ExecuteCommand': self.cli_data.get_fake_discovery(
-                test_target_iqn, test_target_protal),
+                test_target_iqn, test_target_portal),
         }
         self._driver_setup(mock_commands, configuration)
 
@@ -1437,7 +1445,7 @@ class InfortrendiSCSICommonTestCase(InfortrendTestCass):
         self.assertDictMatch(test_iscsi_properties, properties)
 
         expect_cli_cmd = [
-            mock.call('CreateMap', 'part', test_partition_id, '1', '0', '2',
+            mock.call('CreateMap', 'part', test_partition_id, '4', '0', '1',
                       'iqn=%s' % test_connector['initiator']),
         ]
         self._assert_cli_has_calls(expect_cli_cmd)

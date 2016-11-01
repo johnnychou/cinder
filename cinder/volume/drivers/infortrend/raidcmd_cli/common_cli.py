@@ -359,6 +359,13 @@ class InfortrendCommon(object):
 
                     self._update_target_dict(entry, controller)
 
+                    # check the channel status
+                    if entry['curClock'] == '---':
+                        LOG.warning(_LW(
+                            'Controller [%(controller)s] '
+                            'Channel [%(Ch)s] not linked, please check.'), {
+                            'controller': controller, 'Ch': entry['Ch']})
+
     @log_func
     def _update_target_dict(self, channel, controller):
         """Record the target id for mapping.
@@ -398,11 +405,12 @@ class InfortrendCommon(object):
         mcs_dict = {
             'slot_a': {
                 '0': ['0', '1'],
-                '1': ['2']
+                '2': ['2'],
+                '3': ['3'],
             },
             'slot_b': {
                 '0': ['0', '1'],
-                '1': ['2']
+                '2': ['2']
             }
         }
 
@@ -560,8 +568,7 @@ class InfortrendCommon(object):
     def _create_map_with_lun_filter(
             self, part_id, channel_id, lun_id, host, controller='slot_a'):
 
-        host_filter = self._create_target_id_and_host_filter(
-            controller, host)
+        host_filter = self._create_host_filter(host)
         target_id = self.target_dict[controller][channel_id]
 
         commands = (
@@ -570,38 +577,67 @@ class InfortrendCommon(object):
         self._execute('CreateMap', *commands)
 
     @log_func
-    def _create_map_with_mcs(
-            self, part_id, channel_list, lun_id, host, controller='slot_a'):
+    def _iscsi_create_map(
+            self, part_id, channel_dict, lun_id, host, system_id):
+        
+        iqns = []
+        ips = []
+        luns = []
+        host_filter = self._create_host_filter(host)
+        rc, net_list = self._execute('ShowNet')
+        rc, map_info = self._execute('ShowMap', 'part=%s' % part_id)
 
-        map_channel_id = None
-        for channel_id in channel_list:
+        for controller in sorted(channel_dict.keys()):
+            for channel_id in sorted(channel_dict[controller]):
+                target_id = self.target_dict[controller][channel_id]
+                
+                if not self._check_map_exist(
+                    channel_id, target_id, lun_id, map_info):
 
-            host_filter = self._create_target_id_and_host_filter(
-                controller, host)
-            target_id = self.target_dict[controller][channel_id]
+                    commands = (
+                        'part', part_id, channel_id, target_id, lun_id,
+                        host_filter
+                    )
+                    rc, out = self._execute('CreateMap', *commands)
+                    if rc != 0:
+                        msg = _('Volume [%(part_id)s] create map failed, '
+                            'Ch: [%(Ch)s], ID:[%(target_id)s] LUN: [%(lun)s].'), {
+                            'part_id': part_id, 'Ch': channel_id,
+                            'target_id': target_id, 'lun': lun_id,}
+                        LOG.error(msg)
+                        raise exception.VolumeDriverException(message=msg)
 
-            commands = (
-                'part', part_id, channel_id, target_id, lun_id,
-                host_filter
-            )
-            rc, out = self._execute('CreateMap', *commands)
-            if rc == 0:
-                map_channel_id = channel_id
-                break
+                mcs_id = self._get_mcs_id(channel_id, controller)
+                # There might be some channels in the same group
+                for channel in self.mcs_dict[controller][mcs_id]:
+                    target_id = self.target_dict[controller][channel]
+                    map_ch_info = {
+                        'system_id': system_id,
+                        'mcs_id': mcs_id,
+                        'target_id': target_id,
+                        'controller': controller,
+                    }
+                    iqns.append(self._generate_iqn(map_ch_info))
+                    ips.append(self._get_ip_by_channel(
+                        channel, net_list, controller))
+                    luns.append(int(lun_id))
 
-        if map_channel_id is None:
-            msg = _('Failed to create map on mcs, no channel can map.')
-            LOG.error(msg)
-            raise exception.VolumeDriverException(message=msg)
+        return iqns, ips, luns
 
-        return map_channel_id
+    def _check_map_exist(self, channel_id, target_id, lun_id, map_info):
+        if len(map_info) > 0:
+            for entry in map_info:
+                if (entry['Ch'] == channel_id and
+                    entry['Target'] == target_id and
+                    entry['LUN'] == lun_id):
+                    return True
+        return
 
-    def _create_target_id_and_host_filter(self, controller, host):
+    def _create_host_filter(self, host):
         if self.protocol == 'iSCSI':
             host_filter = 'iqn=%s' % host
         else:
             host_filter = 'wwn=%s' % host
-
         return host_filter
 
     def _get_extraspecs_dict(self, volume_type_id):
@@ -686,16 +722,17 @@ class InfortrendCommon(object):
     @log_func
     def _get_mapping_info(self, multipath):
         if self.iscsi_multipath or multipath:
-            return self._get_mapping_info_with_mcs()
+            return self._get_mapping_info_with_mpio()
         else:
             return self._get_mapping_info_with_normal()
 
-    def _get_mapping_info_with_mcs(self):
-        """Get the minimun mapping channel id and multi lun id mapping info.
+    def _get_mapping_info_with_mpio(self):
+        """Get all mapping channel id and minimun lun id mapping info.
 
         # R model with mcs
         map_chl = {
-            'slot_a': ['0', '1']
+            'slot_a': ['2', '0']
+            'slot_b': ['0', '3']
         }
         map_lun = ['0']
 
@@ -705,48 +742,50 @@ class InfortrendCommon(object):
         }
         map_lun = ['0']
 
-        :returns: minimun mapping channel id per slot and multi lun id
+        :returns: all mapping channel id per slot and minimun lun id
         """
         map_chl = {
             'slot_a': []
         }
+        if self._model_type == 'R':
+            map_chl['slot_b'] = []
 
-        min_lun_num = 0
-        map_mcs_group = None
-        for mcs in self.mcs_dict['slot_a']:
-            if len(self.mcs_dict['slot_a'][mcs]) > 1:
-                if min_lun_num < self._get_mcs_channel_lun_map_num(mcs):
-                    min_lun_num = self._get_mcs_channel_lun_map_num(mcs)
-                    map_mcs_group = mcs
+        # MPIO: Map all the channels specified in conf file
+        # If MCS groups exist, only map to the minimum channel id per group
+        for controller in map_chl.keys():
+            for mcs in self.mcs_dict[controller]:
+                map_mcs_chl = sorted((self.mcs_dict[controller][mcs]))[0]
+                map_chl[controller].append(map_mcs_chl)
 
-        if map_mcs_group is None:
-            msg = _('Raid did not have MCS Channel.')
+        map_lun = self._get_minimum_common_lun_id(map_chl)
+
+        if map_lun is None:
+            msg = _('Cannot find a common lun id for mapping.')
             LOG.error(msg)
             raise exception.VolumeDriverException(message=msg)
 
-        map_chl['slot_a'] = self.mcs_dict['slot_a'][map_mcs_group]
-        map_lun = self._get_mcs_channel_lun_map(map_chl['slot_a'])
-        return map_chl, map_lun, map_mcs_group
+        return map_chl, map_lun
 
-    def _get_mcs_channel_lun_map_num(self, mcs_id):
-        lun_num = 0
-        for channel in self.mcs_dict['slot_a'][mcs_id]:
-            lun_num += len(self.map_dict['slot_a'][channel])
-        return lun_num
-
-    def _get_mcs_channel_lun_map(self, channel_list):
-        """Find the common lun id in mcs channel."""
-
+    def _get_minimum_common_lun_id(self, channel_dict):
+        """Find the minimun common lun id in all channels."""
         map_lun = []
         for lun_id in range(self.constants['MAX_LUN_MAP_PER_CHL']):
             check_map = True
-            for channel_id in channel_list:
-                if lun_id not in self.map_dict['slot_a'][channel_id]:
-                    check_map = False
+            for controller in channel_dict.keys():
+                for channel_id in channel_dict[controller]:
+                    if lun_id not in self.map_dict['slot_a'][channel_id]:
+                        check_map = False
             if check_map:
                 map_lun.append(str(lun_id))
+                self.remove_map_dict_lun_id(channel_dict, lun_id)
                 break
+
         return map_lun
+
+    def remove_map_dict_lun_id(self, map_chl_dict, lun_id):
+        for controller in map_chl_dict.keys():
+            for channel_id in map_chl_dict[controller]:
+                self.map_dict[controller][channel_id].remove(lun_id)
 
     @log_func
     def _get_mapping_info_with_normal(self):
@@ -767,12 +806,11 @@ class InfortrendCommon(object):
 
         ret_chl = self._get_minimun_mapping_channel_id('slot_a')
         lun_id = self._get_lun_id(ret_chl, 'slot_a')
-        mcs_id = self._get_mcs_id_by_channel_id(ret_chl)
 
         map_chl['slot_a'].append(ret_chl)
         map_lun.append(str(lun_id))
 
-        return map_chl, map_lun, mcs_id
+        return map_chl, map_lun
 
     @log_func
     def _get_minimun_mapping_channel_id(self, controller):
@@ -781,10 +819,13 @@ class InfortrendCommon(object):
 
         # Sort items to get a reliable behaviour. Dictionary items
         # are iterated in a random order because of hash randomization.
-        for key, value in sorted(self.map_dict[controller].items()):
-            if empty_lun_num < len(value):
-                min_map_chl = key
-                empty_lun_num = len(value)
+        # We don't care MCS group here, single path working as well.
+        for mcs in sorted(self.mcs_dict[controller].keys()):
+            mcs_chl = sorted((self.mcs_dict[controller][mcs]))[0]
+            free_lun_num = len(self.map_dict[controller][mcs_chl])
+            if empty_lun_num < free_lun_num:
+                min_map_chl = mcs_chl
+                empty_lun_num = free_lun_num
 
         if int(min_map_chl) < 0:
             msg = _('LUN map overflow on every channel.')
@@ -810,11 +851,11 @@ class InfortrendCommon(object):
                 break
         return map_lun
 
-    def _get_mcs_id_by_channel_id(self, channel_id):
+    def _get_mcs_id(self, channel_id, controller):
         mcs_id = None
 
-        for mcs in self.mcs_dict['slot_a']:
-            if channel_id in self.mcs_dict['slot_a'][mcs]:
+        for mcs in self.mcs_dict[controller]:
+            if channel_id in self.mcs_dict[controller][mcs]:
                 mcs_id = mcs
                 break
 
@@ -1367,65 +1408,25 @@ class InfortrendCommon(object):
         partition_data = self._extract_all_provider_location(
             volume['provider_location'])  # system_id, part_id
 
-        part_id = partition_data['partition_id']
-
+        system_id = partition_data['system_id']
+        part_id = partition_data['partition_id']        
         if part_id is None:
             part_id = self._get_part_id(volume_id)
 
         self._set_host_iqn(connector['initiator'])
 
-        map_chl, map_lun, mcs_id = self._get_mapping_info(multipath)
+        map_chl, map_lun = self._get_mapping_info(multipath)
 
         lun_id = map_lun[0]
 
-        if self.iscsi_multipath or multipath:
-            channel_id = self._create_map_with_mcs(
-                part_id, map_chl['slot_a'], lun_id, connector['initiator'])
-        else:
-            channel_id = map_chl['slot_a'][0]
-
-            self._create_map_with_lun_filter(
-                part_id, channel_id, lun_id, connector['initiator'])
-
-        rc, net_list = self._execute('ShowNet')
-        ip = self._get_ip_by_channel(channel_id, net_list)
-
-        if ip is None:
-            msg = _(
-                'Failed to get ip on Channel %(channel_id)s '
-                'with volume: %(volume_id)s.') % {
-                    'channel_id': channel_id, 'volume_id': volume_id}
-            LOG.error(msg)
-            raise exception.VolumeDriverException(message=msg)
-
-        partition_data = self._combine_channel_lun_target_id(
-            partition_data, mcs_id, lun_id, channel_id)
-
-        property_value = [{
-            'lun_id': partition_data['lun_id'],
-            'iqn': self._generate_iqn(partition_data),
-            'ip': ip,
-            'port': self.constants['ISCSI_PORT'],
-        }]
+        iqns, ips, luns = self._iscsi_create_map(
+            part_id, map_chl, lun_id, connector['initiator'], system_id)
 
         properties = self._generate_iscsi_connection_properties(
-            property_value, volume)
+            iqns, ips, luns, volume, multipath)
         LOG.info(_LI('Successfully initialized connection '
                      'with volume: %(volume_id)s.'), properties['data'])
         return properties
-
-    @log_func
-    def _combine_channel_lun_target_id(
-            self, partition_data, mcs_id, lun_id, channel_id):
-
-        target_id = self.target_dict['slot_a'][channel_id]
-
-        partition_data['mcs_id'] = mcs_id
-        partition_data['lun_id'] = lun_id
-        partition_data['target_id'] = target_id
-        partition_data['slot_id'] = 1
-
-        return partition_data
 
     def _set_host_iqn(self, host_iqn):
 
@@ -1447,12 +1448,13 @@ class InfortrendCommon(object):
             return iqn
 
     @log_func
-    def _generate_iqn(self, partition_data):
+    def _generate_iqn(self, channel_info):
+        slot_id = 1 if channel_info['controller'] == 'slot_a' else 2
         return self.iqn % (
-            partition_data['system_id'],
-            partition_data['mcs_id'],
-            partition_data['target_id'],
-            partition_data['slot_id'])
+            channel_info['system_id'],
+            channel_info['mcs_id'],
+            channel_info['target_id'],
+            slot_id)
 
     @log_func
     def _get_ip_by_channel(
@@ -1463,6 +1465,13 @@ class InfortrendCommon(object):
         for entry in net_list:
             if entry['ID'] == channel_id and entry['Slot'] == slot_name:
                 return entry['IPv4']
+
+        msg = _(
+            'Failed to get ip on Channel [%(channel_id)s] '
+            'with controller [%(controller)s].') % {
+                'channel_id': channel_id, 'controller': slot_name}
+        LOG.error(msg)
+        raise exception.VolumeDriverException(message=msg)
         return
 
     def _get_wwpn_list(self):
@@ -1490,33 +1499,42 @@ class InfortrendCommon(object):
 
     @log_func
     def _generate_iscsi_connection_properties(
-            self, property_value, volume):
+            self, iqns, ips, luns, volume, multipath):
 
-        properties = {}
-        discovery_exist = False
+        portals = []
 
-        specific_property = property_value[0]
+        for i in range(len(ips)):
+            discovery_ip = '%s:%s' % (
+                ips[i], self.constants['ISCSI_PORT'])
+            discovery_iqn = iqns[i]
+            portals.append(discovery_ip)
 
-        discovery_ip = '%s:%s' % (
-            specific_property['ip'], specific_property['port'])
-        discovery_iqn = specific_property['iqn']
+            if not self._do_iscsi_discovery(discovery_iqn, discovery_ip):
+                msg = _(
+                    'Could not find iSCSI target '
+                    'for volume: [%(volume_id)s] '
+                    'portal: [%(discovery_ip)s] '
+                    'iqn: [%(discovery_iqn)s]' 
+                    'for path: [%(i)s/%(len)s]') % {
+                        'volume_id': volume['id'],
+                        'discovery_ip': discovery_ip,
+                        'discovery_iqn': discovery_iqn,
+                        'i': i+1, 'len': len(ips),}
+                LOG.error(msg)
+                raise exception.VolumeDriverException(message=msg)
 
-        if self._do_iscsi_discovery(discovery_iqn, discovery_ip):
-            properties['target_portal'] = discovery_ip
-            properties['target_iqn'] = discovery_iqn
-            properties['target_lun'] = int(specific_property['lun_id'])
-            discovery_exist = True
+        properties = {
+            'target_discovered': True,
+            'target_iqn': iqns[0],
+            'target_portal': portals[0],
+            'target_lun': luns[0],
+            'volume_id': volume['id'],
+        }
 
-        if not discovery_exist:
-            msg = _(
-                'Could not find iSCSI target '
-                'for volume: %(volume_id)s.') % {
-                    'volume_id': volume['id']}
-            LOG.error(msg)
-            raise exception.VolumeDriverException(message=msg)
-
-        properties['target_discovered'] = discovery_exist
-        properties['volume_id'] = volume['id']
+        if self.iscsi_multipath or multipath:
+            properties['target_iqns'] = iqns
+            properties['target_portals'] = portals
+            properties['target_luns'] = luns
 
         if 'provider_auth' in volume:
             auth = volume['provider_auth']
